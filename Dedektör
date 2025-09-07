@@ -1,0 +1,324 @@
+import pyaudio
+import numpy as np
+import time
+from collections import deque
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import json
+import os
+
+# Sabit Değişkenler
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+CHUNK = 4096
+
+# Filtre ve Eşik Parametreleri
+MIN_FREQ_HZ = 100
+MAX_FREQ_HZ = 2000
+SMOOTHING_WINDOW_SIZE = 10
+THRESHOLD_PERCENT = 10
+
+# Kalibrasyon ve metal verileri için dosya adı
+DATA_FILE = "calibration_data.json"
+
+class MetalDedectorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Akıllı Metal Dedektörü")
+        self.root.geometry("400x350")
+        self.root.resizable(False, False)
+
+        # Durum değişkenleri
+        self.is_running = False
+        self.is_calibrating = False
+        self.stream = None
+        self.pyaudio_instance = None
+        self.base_frequency = None
+        self.metal_data = {"altin": [], "gumus": [], "demir": []}
+        self.calibration_frequencies = []
+        self.smoothed_freq_history = deque(maxlen=SMOOTHING_WINDOW_SIZE)
+
+        # Arayüzü oluştur ve kalibrasyon verilerini yükle
+        self.create_widgets()
+        self.load_calibration_data()
+        
+    def create_widgets(self):
+        # Durum butonu
+        self.status_button = tk.Button(self.root, text="HAZIR", width=25, height=5,
+                                       font=("Helvetica", 12, "bold"), bd=5, relief="raised", bg="gray")
+        self.status_button.pack(pady=10)
+
+        # Frekans ve tespit etiketi
+        self.info_label = ttk.Label(self.root, text="Frekans: --- Hz\nTespit: ---", font=("Helvetica", 14))
+        self.info_label.pack(pady=5)
+
+        # Durum mesajı etiketi
+        self.message_label = ttk.Label(self.root, text="Başlamak için 'Kalibre Et'e basın.", font=("Helvetica", 10))
+        self.message_label.pack(pady=5)
+        
+        # Butonlar
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(pady=10)
+
+        self.calibrate_button = ttk.Button(button_frame, text="Kalibre Et", command=self.start_calibration)
+        self.calibrate_button.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.finish_calibrate_btn = ttk.Button(button_frame, text="Kalibrasyonu Bitir ve Kaydet", state=tk.DISABLED, command=self.finish_calibration)
+        self.finish_calibrate_btn.grid(row=0, column=1, padx=5, pady=5)
+
+        self.start_button = ttk.Button(button_frame, text="Başlat", state=tk.DISABLED, command=self.start_detection)
+        self.start_button.grid(row=1, column=0, padx=5, pady=5)
+
+        self.stop_button = ttk.Button(button_frame, text="Durdur", state=tk.DISABLED, command=self.stop_detection)
+        self.stop_button.grid(row=1, column=1, padx=5, pady=5)
+        
+        # Metal Kayıt Çerçevesi
+        record_frame = ttk.LabelFrame(self.root, text="Metal Frekanslarını Kaydet")
+        record_frame.pack(pady=10, padx=20, fill="x")
+
+        self.record_gold_btn = ttk.Button(record_frame, text="Altın Kaydet", state=tk.DISABLED, command=lambda: self.record_metal("altin"))
+        self.record_gold_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        
+        self.record_silver_btn = ttk.Button(record_frame, text="Gümüş Kaydet", state=tk.DISABLED, command=lambda: self.record_metal("gumus"))
+        self.record_silver_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        
+        self.record_iron_btn = ttk.Button(record_frame, text="Demir Kaydet", state=tk.DISABLED, command=lambda: self.record_metal("demir"))
+        self.record_iron_btn.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+
+    def update_status_button(self, color, text):
+        self.status_button.config(bg=color, text=text)
+
+    def update_info(self, freq_text="--- Hz", detection_text="---"):
+        self.info_label.config(text=f"Frekans: {freq_text}\nTespit: {detection_text}")
+
+    def update_message(self, text):
+        self.message_label.config(text=text)
+
+    def load_calibration_data(self):
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, "r") as f:
+                    data = json.load(f)
+                    self.base_frequency = data.get("base_frequency")
+                    self.metal_data = data.get("metal_data", {"altin": [], "gumus": [], "demir": []})
+                    if self.base_frequency is not None:
+                        self.update_message("Kayıtlı veriler yüklendi. Başlat'a basabilirsiniz.")
+                        self.start_button.config(state=tk.NORMAL)
+                    else:
+                        self.update_message("Kayıtlı kalibrasyon verisi bulunamadı.")
+            except (IOError, json.JSONDecodeError):
+                self.update_message("Hatalı kalibrasyon verisi.")
+        else:
+            self.update_message("Henüz kalibrasyon verisi kaydedilmemiş.")
+            
+    def save_data(self):
+        try:
+            with open(DATA_FILE, "w") as f:
+                json.dump({
+                    "base_frequency": self.base_frequency,
+                    "metal_data": self.metal_data
+                }, f)
+            self.update_message("Tüm veriler başarıyla kaydedildi.")
+        except Exception as e:
+            self.update_message(f"Veri kaydetme hatası: {e}", "red")
+
+    def start_audio_stream(self):
+        try:
+            if self.stream: self.stream.close()
+            if self.pyaudio_instance: self.pyaudio_instance.terminate()
+
+            self.pyaudio_instance = pyaudio.PyAudio()
+            self.stream = self.pyaudio_instance.open(
+                format=FORMAT, channels=CHANNELS, rate=RATE,
+                input=True, frames_per_buffer=CHUNK
+            )
+            return True
+        except Exception as e:
+            messagebox.showerror("Hata", f"Mikrofon başlatılamadı: {e}\nLütfen mikrofonunuzun bağlı ve izinlerinin açık olduğundan emin olun.")
+            self.update_message("Mikrofon hatası. Uygulama başlatılamadı.")
+            return False
+
+    def get_dominant_frequency(self):
+        try:
+            data = self.stream.read(CHUNK, exception_on_overflow=False)
+            data_np = np.frombuffer(data, dtype=np.int16)
+            fft_data = np.fft.fft(data_np)
+            freqs = np.fft.fftfreq(CHUNK, 1.0/RATE)
+            
+            freq_mask = (freqs > MIN_FREQ_HZ) & (freqs < MAX_FREQ_HZ)
+            positive_freqs = freqs[freq_mask]
+            positive_fft = np.abs(fft_data[freq_mask])
+            
+            if not positive_fft.any():
+                return None
+                
+            idx = np.argmax(positive_fft)
+            dominant_freq = positive_freqs[idx]
+            return dominant_freq
+        except Exception as e:
+            self.update_message(f"Frekans okuma hatası: {e}")
+            return None
+
+    def start_calibration(self):
+        if self.is_calibrating: return
+        if not self.start_audio_stream(): return
+            
+        self.is_calibrating = True
+        self.calibration_frequencies = []
+        self.update_message("Kalibrasyon başladı. Lütfen tüm metalleri uzaklaştırın ve hazır olunca 'Kalibrasyonu Bitir' butonuna basın.")
+        self.update_status_button("yellow", "KALİBRE EDİLİYOR")
+
+        # Butonları ayarla
+        self.calibrate_button.config(state=tk.DISABLED)
+        self.finish_calibrate_btn.config(state=tk.NORMAL)
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        self.record_gold_btn.config(state=tk.NORMAL)
+        self.record_silver_btn.config(state=tk.NORMAL)
+        self.record_iron_btn.config(state=tk.NORMAL)
+
+        threading.Thread(target=self.run_calibration_thread, daemon=True).start()
+
+    def run_calibration_thread(self):
+        while self.is_calibrating:
+            freq = self.get_dominant_frequency()
+            if freq is not None:
+                self.calibration_frequencies.append(freq)
+                self.update_info(freq_text=f"{freq:.2f} Hz", detection_text="...")
+            time.sleep(0.1)
+
+    def finish_calibration(self):
+        self.is_calibrating = False
+        self.stop_audio_stream()
+
+        if len(self.calibration_frequencies) > 10:
+            self.base_frequency = np.median(self.calibration_frequencies)
+            self.update_message(f"Kalibrasyon tamamlandı. Temel frekans: {self.base_frequency:.2f} Hz. Metal frekanslarını da kaydettiyseniz 'Başlat'a basabilirsiniz.")
+            self.update_status_button("green", "HAZIR")
+            self.save_data()
+            self.start_button.config(state=tk.NORMAL)
+        else:
+            self.update_message("Kalibrasyon başarısız. Yeterli veri toplanamadı.")
+            self.update_status_button("red", "HATA")
+            self.start_button.config(state=tk.DISABLED)
+        
+        # Buton durumlarını eski haline getir
+        self.calibrate_button.config(state=tk.NORMAL)
+        self.finish_calibrate_btn.config(state=tk.DISABLED)
+        self.record_gold_btn.config(state=tk.DISABLED)
+        self.record_silver_btn.config(state=tk.DISABLED)
+        self.record_iron_btn.config(state=tk.DISABLED)
+
+    def record_metal(self, metal_type):
+        if not self.is_calibrating:
+            self.update_message("Önce kalibrasyonu başlatın!")
+            return
+
+        freq = self.get_dominant_frequency()
+        if freq is not None:
+            self.metal_data[metal_type].append(freq)
+            self.update_message(f"'{metal_type.capitalize()}' frekansı kaydedildi: {freq:.2f} Hz")
+            self.update_status_button("orange", f"{metal_type.upper()} KAYDEDİLDİ")
+
+    def start_detection(self):
+        if self.is_running or self.base_frequency is None: return
+        if not self.start_audio_stream(): return
+
+        if not any(self.metal_data.values()):
+            messagebox.showwarning("Uyarı", "Lütfen en az bir metal türü için frekans kaydedin.")
+            self.stop_audio_stream()
+            return
+
+        self.is_running = True
+        self.update_message("Dedektör çalışıyor...")
+        self.update_status_button("lightgreen", "TARAMA YAPILIYOR")
+
+        # Butonları ayarla
+        self.calibrate_button.config(state=tk.DISABLED)
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.finish_calibrate_btn.config(state=tk.DISABLED)
+        self.record_gold_btn.config(state=tk.DISABLED)
+        self.record_silver_btn.config(state=tk.DISABLED)
+        self.record_iron_btn.config(state=tk.DISABLED)
+
+        self.smoothed_freq_history.clear()
+
+        threading.Thread(target=self.run_detection_thread, daemon=True).start()
+
+    def run_detection_thread(self):
+        while self.is_running:
+            raw_freq = self.get_dominant_frequency()
+            if raw_freq is None: continue
+
+            self.smoothed_freq_history.append(raw_freq)
+            if len(self.smoothed_freq_history) < SMOOTHING_WINDOW_SIZE: continue
+            
+            smoothed_freq = np.mean(list(self.smoothed_freq_history))
+            
+            # Metal sınıflandırma
+            detected_metal = "---"
+            min_diff = float('inf')
+
+            # Her metalin ortalama frekansına göre en yakın olanı bul
+            for metal_type, freqs in self.metal_data.items():
+                if not freqs: continue
+                avg_freq = np.mean(freqs)
+                diff = abs(smoothed_freq - avg_freq)
+                if diff < min_diff:
+                    min_diff = diff
+                    detected_metal = metal_type
+            
+            self.update_info(f"{smoothed_freq:.2f} Hz", f"Tespit: {detected_metal.capitalize()}")
+            
+            # Görsel geri bildirim
+            if detected_metal == "altin":
+                self.update_status_button("#FFD700", "ALTIN TESPİT EDİLDİ!")
+            elif detected_metal == "gumus":
+                self.update_status_button("#C0C0C0", "GÜMÜŞ TESPİT EDİLDİ!")
+            elif detected_metal == "demir":
+                self.update_status_button("#B76E79", "DEMİR TESPİT EDİLDİ!")
+            else:
+                self.update_status_button("lightgreen", "TARAMA YAPILIYOR")
+
+            time.sleep(0.1)
+    
+    def stop_detection(self):
+        if self.is_running or self.is_calibrating:
+            self.is_running = False
+            self.is_calibrating = False
+            self.stop_audio_stream()
+            
+            self.update_message("Dedektör durduruldu.")
+            self.update_status_button("gray", "HAZIR")
+            self.update_info("--- Hz", "---")
+            
+            # Butonları ayarla
+            self.calibrate_button.config(state=tk.NORMAL)
+            self.start_button.config(state=tk.NORMAL if self.base_frequency is not None else tk.DISABLED)
+            self.stop_button.config(state=tk.DISABLED)
+            self.finish_calibrate_btn.config(state=tk.DISABLED)
+            self.record_gold_btn.config(state=tk.DISABLED)
+            self.record_silver_btn.config(state=tk.DISABLED)
+            self.record_iron_btn.config(state=tk.DISABLED)
+    
+    def stop_audio_stream(self):
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+        if self.pyaudio_instance:
+            self.pyaudio_instance.terminate()
+            self.pyaudio_instance = None
+            
+    def on_closing(self):
+        self.stop_detection()
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MetalDedectorApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
